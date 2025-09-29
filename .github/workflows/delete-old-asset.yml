@@ -1,0 +1,91 @@
+name: Delete old release asset
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # Spustí se každý den v 2:00 UTC
+  workflow_dispatch:      # Možnost spustit ručně
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Purge stale release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # nebo použij PAT, pokud je potřeba
+          REPO: ${{ github.repository }}
+          FILE_NAME: "GetFromProemion_v1.4.7z"
+          MAX_AGE_DAYS: "7"
+        run: |
+          set -euo pipefail
+
+          echo "DEBUG: running workflow on ref=$GITHUB_REF sha=$GITHUB_SHA"
+
+          releases=$(curl -sS \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+
+          echo "DEBUG: releases response type=$(echo "$releases" | jq -r 'type')"
+          echo "DEBUG: releases preview:" $(echo "$releases" | jq -r 'if (type=="array") then (.[0] | tostring) else tostring end' | cut -c1-200)
+
+          # Kontrola chybové zprávy z API
+          message=$(echo "$releases" | jq -r 'if type == "object" then .message // empty else empty end')
+          if [ -n "$message" ]; then
+            echo "GitHub API chyba: $message"
+            exit 1
+          fi
+
+          release_count=$(echo "$releases" | jq 'if type == "array" then length else 0 end')
+          if [ "$release_count" -eq 0 ]; then
+            echo "Repozitář $REPO nemá žádné release – není co mazat."
+            exit 0
+          fi
+
+          # Projdi všechny releasy a hledej asset ke smazání
+          found=0
+          for row in $(echo "$releases" | jq -c '.[]'); do
+            release_name=$(echo "$row" | jq -r '.name // .tag_name // "untagged"')
+            for asset in $(echo "$row" | jq -c '.assets[]?'); do
+              asset_name=$(echo "$asset" | jq -r '.name')
+              asset_id=$(echo "$asset" | jq -r '.id')
+              asset_created=$(echo "$asset" | jq -r '.created_at')
+              if [ "$asset_name" = "$FILE_NAME" ]; then
+                # Spočítej stáří assetu v dnech
+                age_days=$(( ( $(date -d now +%s) - $(date -d "$asset_created" +%s) ) / 86400 ))
+                echo "Asset $asset_name v release $release_name je starý $age_days dní."
+                if [ "$age_days" -ge "${MAX_AGE_DAYS:-7}" ]; then
+                  echo "Mažu asset s ID $asset_id..."
+                  code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+                    -H "Authorization: Bearer $GITHUB_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$REPO/releases/assets/$asset_id")
+                  if [ "$code" = "204" ]; then
+                    echo "Asset úspěšně odstraněn."
+                  else
+                    echo "Mazání assetu selhalo s HTTP kódem $code."
+                  fi
+                  found=1
+                else
+                  echo "Asset je mladší než ${MAX_AGE_DAYS:-7} dní, ponechávám ho."
+                fi
+              fi
+            done
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "Asset $FILE_NAME nebyl nalezen v žádném releasu."
+          fi
+
+      - name: Debug – vypiš všechny releasy a assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          releases=$(curl -sS \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+          echo "=== RELEASES JSON ==="
+          echo "$releases" | jq '.[] | {name, tag_name, draft, prerelease, assets: [.assets[]? | {id, name, created_at, size}]}' || echo "$releases"
+          echo "=== END RELEASES ==="
